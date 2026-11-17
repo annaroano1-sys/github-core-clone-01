@@ -21,7 +21,7 @@
 // cannot be derived from it; the scenario fixes it to adaiversen (id 1000).
 // Teammate quinnkeller, stranger olgabauer, org faint-meadow-org, default branch main.
 
-import http from 'node:http';
+import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
@@ -1227,8 +1227,8 @@ function commentJson(repo: Repo, issue: Issue, comment: Comment): Record<string,
 // ---------------------------------------------------------------------------
 
 interface RequestContext {
-  req: http.IncomingMessage;
-  res: http.ServerResponse;
+  req: RawHttpRequest;
+  res: RawHttpResponse;
   method: string;
   pathname: string;
   segments: string[];
@@ -1297,29 +1297,354 @@ function checkAuth(ctx: RequestContext): boolean {
   return false;
 }
 
-function readBody(req: http.IncomingMessage, limitBytes = 64 * 1024 * 1024): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let rejected = false;
-    req.on('data', (chunk: Buffer) => {
-      if (rejected) return;
-      total += chunk.length;
-      if (total > limitBytes) {
-        rejected = true;
-        reject(new Error('request body is too large'));
-        return;
+// ---------------------------------------------------------------------------
+// Raw HTTP/1.1 transport over net sockets (no Node http server).
+//
+// Why: the per-request cost was dominated by Node's HTTP machinery (llhttp
+// parsing, IncomingMessage/ServerResponse allocation, stream bookkeeping,
+// writev syscalls) plus scheduling. A hand-rolled parser over a raw socket
+// keeps one Buffer per request, one write per response, and nothing else.
+// The handlers only ever need method, target, a few lowercase headers, the
+// body, writeHead and end — so those are the whole interface below.
+//
+// What the parser supports (HTTP/1.1, origin-form + absolute-form targets):
+// Content-Length bodies, chunked transfer-encoding, Expect: 100-continue,
+// keep-alive (default on 1.1), pipelined requests answered in order, HEAD
+// (headers only, Content-Length kept), Connection: close, and 64 KiB header
+// / 64 MiB body limits. Anything malformed gets a 400 and the socket closed.
+// ---------------------------------------------------------------------------
+
+/** The request view the handlers need: method, target, lowercase headers, body. */
+interface RawHttpRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string | undefined>;
+  body: Buffer;
+}
+
+/** The response view the handlers need: writeHead + end, same names as ServerResponse. */
+interface RawHttpResponse {
+  writeHead(status: number, headers: Record<string, string>): void;
+  end(body?: Buffer | string): void;
+  headSent(): boolean;
+}
+
+const HTTP_REASON: Record<number, string> = {
+  100: 'Continue',
+  200: 'OK',
+  201: 'Created',
+  202: 'Accepted',
+  204: 'No Content',
+  400: 'Bad Request',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Not Found',
+  405: 'Method Not Allowed',
+  409: 'Conflict',
+  413: 'Content Too Large',
+  422: 'Unprocessable Entity',
+  431: 'Request Header Fields Too Large',
+  500: 'Internal Server Error',
+};
+
+const MAX_HEADER_BYTES = 64 * 1024;
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+/** One response, written to its socket as a single flush (head + body). */
+class SocketResponse implements RawHttpResponse {
+  private statusCode = 200;
+  private responseHeaders: Record<string, string> = {};
+  private sent = false;
+  private readonly socket: net.Socket;
+  private readonly method: string;
+
+  constructor(socket: net.Socket, method: string) {
+    this.socket = socket;
+    this.method = method;
+  }
+
+  headSent(): boolean {
+    return this.sent;
+  }
+
+  writeHead(status: number, headers: Record<string, string>): void {
+    if (this.sent) return;
+    this.statusCode = status;
+    this.responseHeaders = headers;
+  }
+
+  end(body?: Buffer | string): void {
+    if (this.sent) return;
+    this.sent = true;
+    const bodyBuffer =
+      body === undefined ? undefined : typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
+    // Node's http server sends Content-Length: 0 for a body-less reply (except
+    // 204/304, which carry no Content-Length at all). Match that so clients
+    // that count bytes see the same framing.
+    let hasLength = false;
+    for (const name of Object.keys(this.responseHeaders)) {
+      if (name.toLowerCase() === 'content-length') {
+        hasLength = true;
+        break;
       }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (rejected) return;
-      // Most API/git bodies arrive as a single chunk: hand it back without a copy.
-      resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks));
-    });
-    req.on('error', (err) => {
-      if (!rejected) reject(err);
-    });
+    }
+    const headParts: string[] = [
+      `HTTP/1.1 ${this.statusCode} ${HTTP_REASON[this.statusCode] ?? 'Status'}\r\n`,
+    ];
+    for (const name of Object.keys(this.responseHeaders)) {
+      headParts.push(`${name}: ${this.responseHeaders[name]}\r\n`);
+    }
+    if (!hasLength && this.statusCode !== 204 && this.statusCode !== 304) {
+      headParts.push(`Content-Length: ${bodyBuffer === undefined ? 0 : bodyBuffer.length}\r\n`);
+    }
+    headParts.push('\r\n');
+    const head = Buffer.from(headParts.join(''), 'ascii');
+    if (this.method === 'HEAD' || bodyBuffer === undefined || bodyBuffer.length === 0) {
+      this.socket.write(head);
+      return;
+    }
+    // Cork so head + body leave in one writev instead of two syscalls.
+    this.socket.cork();
+    this.socket.write(head);
+    this.socket.write(bodyBuffer);
+    this.socket.uncork();
+  }
+}
+
+/** Parse and serve HTTP/1.1 requests on one raw socket, in order. */
+function handleSocket(socket: net.Socket): void {
+  // NoDelay: a small request + small response must not wait on Nagle vs
+  // delayed-ACK. (Node's http server does the same for its sockets.)
+  socket.setNoDelay(true);
+  socket.setTimeout(30000);
+  socket.on('timeout', () => socket.destroy());
+  socket.on('error', () => socket.destroy());
+
+  let buf: Buffer = EMPTY_BODY; // pending unparsed bytes
+  let busy = false;
+  let dead = false;
+  socket.on('close', () => {
+    dead = true;
+  });
+
+  // The request currently being assembled (headers parsed, body still arriving).
+  let pending: {
+    method: string;
+    url: string;
+    version: string;
+    headers: Record<string, string | undefined>;
+    keepAlive: boolean;
+    framing: 'none' | 'length' | 'chunked';
+    contentLength: number;
+    chunks: Buffer[];
+    chunkSize: number; // -1: reading a chunk-size line; >= 0: bytes left in this chunk
+    chunkTotal: number;
+    continueSent: boolean;
+  } | null = null;
+
+  const fail = (status: number): void => {
+    if (dead) return;
+    dead = true;
+    try {
+      socket.write(
+        `HTTP/1.1 ${status} ${HTTP_REASON[status] ?? 'Status'}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`,
+        'ascii',
+      );
+    } catch {
+      // Already gone.
+    }
+    socket.destroy();
+  };
+
+  /** Complete the pending request from buf when enough bytes are in, else null. */
+  const tryComplete = (): { request: RawHttpRequest; keepAlive: boolean } | null => {
+    if (pending === null) {
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0) {
+        if (buf.length > MAX_HEADER_BYTES) fail(431);
+        return null;
+      }
+      const head = buf.toString('ascii', 0, end);
+      buf = buf.subarray(end + 4);
+      const lines = head.split('\r\n');
+      const requestLine = lines[0] ?? '';
+      const firstSpace = requestLine.indexOf(' ');
+      const lastSpace = requestLine.lastIndexOf(' ');
+      if (firstSpace <= 0 || lastSpace <= firstSpace) {
+        fail(400);
+        return null;
+      }
+      const method = requestLine.slice(0, firstSpace);
+      const url = requestLine.slice(firstSpace + 1, lastSpace);
+      const version = requestLine.slice(lastSpace + 1);
+      if (!version.startsWith('HTTP/')) {
+        fail(400);
+        return null;
+      }
+      const headers: Record<string, string | undefined> = {};
+      for (let i = 1; i < lines.length; i += 1) {
+        const line = lines[i]!;
+        const colon = line.indexOf(':');
+        if (colon <= 0) {
+          fail(400);
+          return null;
+        }
+        const name = line.slice(0, colon).trim().toLowerCase();
+        const value = line.slice(colon + 1).trim();
+        const prev = headers[name];
+        headers[name] = prev === undefined ? value : `${prev}, ${value}`;
+      }
+      const connection = (headers.connection ?? '').toLowerCase();
+      const keepAlive =
+        version === 'HTTP/1.1' ? connection !== 'close' : connection === 'keep-alive';
+      const transferEncoding = (headers['transfer-encoding'] ?? '').toLowerCase();
+      let framing: 'none' | 'length' | 'chunked' = 'none';
+      let contentLength = 0;
+      if (transferEncoding.includes('chunked')) {
+        framing = 'chunked';
+      } else if (headers['content-length'] !== undefined) {
+        contentLength = Number.parseInt(headers['content-length'], 10);
+        if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+          fail(400);
+          return null;
+        }
+        if (contentLength > MAX_BODY_BYTES) {
+          fail(413);
+          return null;
+        }
+        framing = contentLength === 0 ? 'none' : 'length';
+      }
+      pending = {
+        method,
+        url,
+        version,
+        headers,
+        keepAlive,
+        framing,
+        contentLength,
+        chunks: [],
+        chunkSize: -1,
+        chunkTotal: 0,
+        continueSent: false,
+      };
+    }
+
+    // The client waits for 100-continue before sending the body: answer now.
+    if (
+      pending.framing !== 'none' &&
+      !pending.continueSent &&
+      (pending.headers.expect ?? '').toLowerCase() === '100-continue'
+    ) {
+      pending.continueSent = true;
+      try {
+        socket.write('HTTP/1.1 100 Continue\r\n\r\n', 'ascii');
+      } catch {
+        // Gone.
+      }
+    }
+
+    const finish = (body: Buffer): { request: RawHttpRequest; keepAlive: boolean } => {
+      const p = pending!;
+      pending = null;
+      return { request: { method: p.method, url: p.url, headers: p.headers, body }, keepAlive: p.keepAlive };
+    };
+
+    if (pending.framing === 'none') return finish(EMPTY_BODY);
+    if (pending.framing === 'length') {
+      if (buf.length < pending.contentLength) return null;
+      const body = buf.subarray(0, pending.contentLength);
+      buf = buf.subarray(pending.contentLength);
+      return finish(body);
+    }
+    // Chunked: size line, payload, CRLF, repeat; a zero size ends the body.
+    for (;;) {
+      if (pending.chunkSize < 0) {
+        const eol = buf.indexOf('\r\n');
+        if (eol < 0) return null;
+        const sizeLine = buf.toString('ascii', 0, eol).split(';')[0]!.trim();
+        buf = buf.subarray(eol + 2);
+        const size = Number.parseInt(sizeLine, 16);
+        if (!Number.isSafeInteger(size) || size < 0) {
+          fail(400);
+          return null;
+        }
+        if (size === 0) {
+          // Trailers: header lines until an empty line.
+          for (;;) {
+            const trailerEnd = buf.indexOf('\r\n');
+            if (trailerEnd < 0) return null;
+            if (trailerEnd === 0) {
+              buf = buf.subarray(2);
+              break;
+            }
+            buf = buf.subarray(trailerEnd + 2);
+          }
+          const body =
+            pending.chunks.length === 0
+              ? EMPTY_BODY
+              : pending.chunks.length === 1
+                ? pending.chunks[0]!
+                : Buffer.concat(pending.chunks);
+          return finish(body);
+        }
+        pending.chunkTotal += size;
+        if (pending.chunkTotal > MAX_BODY_BYTES) {
+          fail(413);
+          return null;
+        }
+        pending.chunkSize = size;
+      }
+      if (buf.length < pending.chunkSize) return null;
+      if (pending.chunkSize > 0) {
+        pending.chunks.push(buf.subarray(0, pending.chunkSize));
+        buf = buf.subarray(pending.chunkSize);
+      }
+      pending.chunkSize = -1;
+      // The chunk is followed by CRLF.
+      if (buf.length < 2) return null;
+      if (buf[0] !== 13 || buf[1] !== 10) {
+        fail(400);
+        return null;
+      }
+      buf = buf.subarray(2);
+    }
+  };
+
+  const pump = async (): Promise<void> => {
+    if (busy || dead) return;
+    busy = true;
+    try {
+      for (;;) {
+        if (dead) return;
+        const parsed = tryComplete();
+        if (parsed === null) return;
+        const res = new SocketResponse(socket, parsed.request.method);
+        try {
+          await dispatch(parsed.request, res);
+        } catch {
+          if (!res.headSent()) {
+            try {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ message: 'internal error' }));
+            } catch {
+              // The response is already gone; nothing more to do.
+            }
+          }
+        }
+        if (dead) return;
+        if (!parsed.keepAlive) {
+          socket.end();
+          return;
+        }
+      }
+    } finally {
+      busy = false;
+    }
+  };
+
+  socket.on('data', (chunk: Buffer) => {
+    buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+    void pump();
   });
 }
 
@@ -3801,11 +4126,11 @@ function isGitPath(segments: string[]): boolean {
   return segments.length >= 2 && segments[1]!.endsWith('.git');
 }
 
-async function dispatch(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+async function dispatch(req: RawHttpRequest, res: RawHttpResponse): Promise<void> {
   // Manual URL split: the suite's requests are plain origin-form paths with an optional
   // query, and building a URL object (plus its searchParams) per request is pure
   // overhead here. Absolute-form URLs (proxy style) are reduced to their path first.
-  let pathAndQuery = req.url ?? '/';
+  let pathAndQuery = req.url;
   if (pathAndQuery.startsWith('http://') || pathAndQuery.startsWith('https://')) {
     const slash = pathAndQuery.indexOf('/', pathAndQuery.indexOf('://') + 3);
     pathAndQuery = slash < 0 ? '/' : pathAndQuery.slice(slash);
@@ -3813,15 +4138,10 @@ async function dispatch(req: http.IncomingMessage, res: http.ServerResponse): Pr
   const qIndex = pathAndQuery.indexOf('?');
   const pathname = qIndex < 0 ? pathAndQuery : pathAndQuery.slice(0, qIndex);
   const rawSegments = pathname.split('/').filter((segment) => segment !== '');
-  const method = (req.method ?? 'GET').toUpperCase();
-  // Body-less requests (GET/HEAD/DELETE with no content) never wait on the stream.
-  const hasBody =
-    method === 'POST' ||
-    method === 'PUT' ||
-    method === 'PATCH' ||
-    (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0') ||
-    req.headers['transfer-encoding'] !== undefined;
-  const body = hasBody ? await readBody(req) : EMPTY_BODY;
+  const method = req.method.toUpperCase();
+  // The body arrives whole: the socket parser already framed it (Content-Length
+  // or chunked), so there is no stream to wait on — body-less requests included.
+  const body = req.body;
   const segments = rawSegments.map((segment) => decodeSegment(segment) ?? segment);
   const ctx: RequestContext = {
     req,
@@ -3918,18 +4238,12 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const server = http.createServer((req, res) => {
-    dispatch(req, res).catch(() => {
-      try {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ message: 'internal error' }));
-      } catch {
-        // The response is already gone; nothing more to do.
-      }
-    });
+  // Raw net server: one socket per connection, requests parsed and answered in
+  // order by handleSocket. Idle sockets die after 30 s (the old keep-alive
+  // timeout); a connection that sends no headers within that window dies too.
+  const server = net.createServer((socket) => {
+    handleSocket(socket);
   });
-  server.keepAliveTimeout = 30000;
-  server.headersTimeout = 60000;
 
   const host = process.env.MAKEFUN_ENV_HOST ?? '127.0.0.1';
   const portEnv = Number.parseInt(process.env.MAKEFUN_ENV_PORT ?? '0', 10);
