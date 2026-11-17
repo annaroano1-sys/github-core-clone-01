@@ -40,6 +40,12 @@ const ENV_URL = process.env.MAKEFUN_ENV_URL ?? '';
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 /** Parse MAKEFUN_TRIAL_NOW (RFC 3339 or epoch ms) to epoch milliseconds. */
+
+// Hot-path constants, computed once: the bearer header the token demands, a shared
+// empty body for body-less requests, and a shared empty query for query-less URLs.
+const AUTH_HEADER = SHOP_TOKEN === '' ? '' : `Bearer ${SHOP_TOKEN}`;
+const EMPTY_BODY: Buffer = Buffer.alloc(0);
+const EMPTY_PARAMS: URLSearchParams = new URLSearchParams();
 function parseTrialNow(text: string | undefined): number {
   const fallback = 1735689600000; // 2025-01-01T00:00:00Z, deterministic
   if (text === undefined || text.trim() === '') return fallback;
@@ -1286,7 +1292,7 @@ function checkAuth(ctx: RequestContext): boolean {
     errorReply(ctx, 401, 'Requires authentication');
     return false;
   }
-  if (header === `Bearer ${token}`) return true;
+  if (header === AUTH_HEADER) return true;
   errorReply(ctx, 401, 'Bad credentials');
   return false;
 }
@@ -1336,6 +1342,8 @@ function bodyString(value: unknown): string {
 
 /** Decode one path segment; null on a malformed percent escape. */
 function decodeSegment(segment: string): string | null {
+  // Most segments carry no escape at all: return them without allocating a copy.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -3487,14 +3495,43 @@ function sidebandPack(pack: Buffer): Buffer {
   return out;
 }
 
-function handleUploadPackV2(repo: Repo, packets: Pkt[]): Buffer {
+/**
+ * Read the v2 command from a raw upload-pack body without decoding all pkt-lines;
+ * null when it cannot be determined (malformed body, or a command other than the two
+ * cached ones). Only the first data packet is inspected.
+ */
+function peekV2Command(body: Buffer): 'ls-refs' | 'fetch' | null {
+  let offset = 0;
+  while (offset + 4 <= body.length) {
+    const header = body.subarray(offset, offset + 4).toString('ascii');
+    if (!/^[0-9a-fA-F]{4}$/.test(header)) return null;
+    const length = Number.parseInt(header, 16);
+    if (length === 0 || length === 1) {
+      offset += 4;
+      continue; // flush / delim
+    }
+    if (length < 4 || offset + length > body.length) return null;
+    const text = body.subarray(offset + 4, offset + length).toString('utf8');
+    if (text.startsWith('command=ls-refs')) return 'ls-refs';
+    if (text.startsWith('command=fetch')) return 'fetch';
+    return null;
+  }
+  return null;
+}
+
+function handleUploadPackV2(repo: Repo, packets: Pkt[], bodyKey: string | null = null): Buffer {
   const firstData = packets.find((packet) => packet.kind === 'data');
   const command = firstData ? firstData.payload.toString('utf8').trim() : '';
   // The cache key is the request itself: identical requests against an unchanged
-  // store always answer identically (see touchRepo / generation).
-  const requestKey = packets.map((packet) => (packet.kind === 'data' ? packet.payload.toString('utf8') : packet.kind)).join('\n');
+  // store always answer identically (see touchRepo / generation). When the caller
+  // already has the raw body, the key is the body bytes; otherwise it is rebuilt
+  // from the decoded packets (same identity, different spelling).
+  const cacheKey = (ns: string): string =>
+    bodyKey !== null
+      ? `${ns}|${repo.generation}|${bodyKey}`
+      : `${ns}|${repo.generation}|${packets.map((packet) => (packet.kind === 'data' ? packet.payload.toString('utf8') : packet.kind)).join('\n')}`;
   if (command.startsWith('command=ls-refs')) {
-    const key = `lsrefs|${repo.generation}|${requestKey}`;
+    const key = cacheKey('lsrefs');
     const hit = gitCacheGet(repo, key);
     if (hit) return hit;
     const body = handleLsRefs(repo, packets);
@@ -3502,7 +3539,7 @@ function handleUploadPackV2(repo: Repo, packets: Pkt[]): Buffer {
     return body;
   }
   if (command.startsWith('command=fetch')) {
-    const key = `fetch|${repo.generation}|${requestKey}`;
+    const key = cacheKey('fetch');
     const hit = gitCacheGet(repo, key);
     if (hit) return hit;
     const args = parseFetchArgs(packets);
@@ -3587,6 +3624,25 @@ async function handleGit(ctx: RequestContext): Promise<boolean> {
       errorReply(ctx, 404, 'Not Found');
       return true;
     }
+    const isV2 = ctx.req.headers['git-protocol'] === 'version=2';
+    if (!isV2) {
+      // A v0 fetch over POST is not used by the suite; answer an empty reply.
+      rawReply(ctx, 200, 'application/x-git-upload-pack-result', pktFlush());
+      return true;
+    }
+    // Fast path: a repeated fetch/ls-refs (the clone workload's 50 concurrent
+    // clones) can hit the cache from the raw body alone, without decoding the
+    // pkt-lines at all. Only the command is peeked from the raw body.
+    const peeked = peekV2Command(ctx.body);
+    const bodyKey = peeked !== null ? ctx.body.toString('latin1') : null;
+    if (peeked !== null && bodyKey !== null) {
+      const key = `${peeked === 'ls-refs' ? 'lsrefs' : 'fetch'}|${repo.generation}|${bodyKey}`;
+      const hit = gitCacheGet(repo, key);
+      if (hit) {
+        rawReply(ctx, 200, 'application/x-git-upload-pack-result', hit);
+        return true;
+      }
+    }
     let packets: Pkt[];
     try {
       packets = decodePktLines(ctx.body);
@@ -3595,13 +3651,7 @@ async function handleGit(ctx: RequestContext): Promise<boolean> {
       rawReply(ctx, 200, 'application/x-git-upload-pack-result', pktFlush());
       return true;
     }
-    const isV2 = ctx.req.headers['git-protocol'] === 'version=2';
-    if (!isV2) {
-      // A v0 fetch over POST is not used by the suite; answer an empty reply.
-      rawReply(ctx, 200, 'application/x-git-upload-pack-result', pktFlush());
-      return true;
-    }
-    const body = handleUploadPackV2(repo, packets);
+    const body = handleUploadPackV2(repo, packets, bodyKey);
     rawReply(ctx, 200, 'application/x-git-upload-pack-result', body);
     return true;
   }
@@ -3752,18 +3802,34 @@ function isGitPath(segments: string[]): boolean {
 }
 
 async function dispatch(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  const rawSegments = url.pathname.split('/').filter((segment) => segment !== '');
+  // Manual URL split: the suite's requests are plain origin-form paths with an optional
+  // query, and building a URL object (plus its searchParams) per request is pure
+  // overhead here. Absolute-form URLs (proxy style) are reduced to their path first.
+  let pathAndQuery = req.url ?? '/';
+  if (pathAndQuery.startsWith('http://') || pathAndQuery.startsWith('https://')) {
+    const slash = pathAndQuery.indexOf('/', pathAndQuery.indexOf('://') + 3);
+    pathAndQuery = slash < 0 ? '/' : pathAndQuery.slice(slash);
+  }
+  const qIndex = pathAndQuery.indexOf('?');
+  const pathname = qIndex < 0 ? pathAndQuery : pathAndQuery.slice(0, qIndex);
+  const rawSegments = pathname.split('/').filter((segment) => segment !== '');
   const method = (req.method ?? 'GET').toUpperCase();
-  const body = await readBody(req);
+  // Body-less requests (GET/HEAD/DELETE with no content) never wait on the stream.
+  const hasBody =
+    method === 'POST' ||
+    method === 'PUT' ||
+    method === 'PATCH' ||
+    (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0') ||
+    req.headers['transfer-encoding'] !== undefined;
+  const body = hasBody ? await readBody(req) : EMPTY_BODY;
   const segments = rawSegments.map((segment) => decodeSegment(segment) ?? segment);
   const ctx: RequestContext = {
     req,
     res,
     method,
-    pathname: url.pathname,
+    pathname,
     segments,
-    query: url.searchParams,
+    query: qIndex < 0 ? EMPTY_PARAMS : new URLSearchParams(pathAndQuery.slice(qIndex + 1)),
     body,
     json: undefined,
   };
